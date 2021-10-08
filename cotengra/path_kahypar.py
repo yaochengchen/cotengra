@@ -5,7 +5,6 @@ from os.path import join, abspath, dirname
 from .core import PartitionTreeBuilder, get_hypergraph
 from .hyper import register_hyper_function
 
-
 # needed to supply kahypar profile files
 KAHYPAR_PROFILE_DIR = join(abspath(dirname(__file__)), 'kahypar_profiles')
 
@@ -41,6 +40,7 @@ def kahypar_subgraph_find_membership(
     mode='direct',
     objective='cut',
     quiet=True,
+    use_cyc = None
 ):
     import kahypar as kahypar
 
@@ -51,7 +51,8 @@ def kahypar_subgraph_find_membership(
     if parts >= nv:
         return list(range(nv))
 
-    hg = get_hypergraph(inputs, output, size_dict, accel=False)
+    #cyc added use_cyc
+    hg = get_hypergraph(inputs, output, size_dict, accel=False, use_cyc=use_cyc)
 
     if compress:
         hg.compress(compress)
@@ -108,6 +109,9 @@ def kahypar_subgraph_find_membership(
 
     kahypar.partition(hypergraph, context)
 
+    if use_cyc == 1:
+        return [hypergraph.blockID(i) for i in hypergraph.nodes()][:hg.origin_num_nodes]# cyc added
+
     return [hypergraph.blockID(i) for i in hypergraph.nodes()]
 
 
@@ -157,13 +161,131 @@ register_hyper_function(
         'imbalance': {'type': 'FLOAT', 'min': 0.001, 'max': 0.05},
         'mode': {'type': 'STRING', 'options': ['direct', 'recursive']},
         'objective': {'type': 'STRING', 'options': ['cut', 'km1']},
-        'groupsize': {'type': 'INT', 'min': 2, 'max': 64},
+        'groupsize': {'type': 'INT', 'min': 2, 'max': 10},
         'fix_output_nodes': {'type': 'STRING', 'options': ['auto', '']},
-        'compress': {'type': 'STRING', 'options': [0, 3, 10, 30, 100]},
-        'sub_optimize': {'type': 'STRING', 'options': ['greedy',
-                                                       'greedy-compressed']},
+        'compress': {'type': 'STRING', 'options': [0, 3, 10, 30, 100]}
     },
     constants={
         'random_strength': 0.0,
+    }
+)
+
+
+
+#cyc added
+
+register_hyper_function(
+    name='cyc_kahypar',
+    ssa_func=kahypar_to_tree.trial_fn,
+    space={
+        'random_strength': {'type': 'FLOAT_EXP', 'min': 0.01, 'max': 10.},
+        'weight_edges': {'type': 'STRING', 'options': ['const', 'log']},
+        'cutoff': {'type': 'INT', 'min': 10, 'max': 40},
+        'imbalance': {'type': 'FLOAT', 'min': 0.01, 'max': 1.0},
+        'imbalance_decay': {'type': 'FLOAT', 'min': -5, 'max': 5},
+        'parts': {'type': 'INT', 'min': 2, 'max': 16},
+        'parts_decay': {'type': 'FLOAT', 'min': 0.0, 'max': 1.0},
+        'mode': {'type': 'STRING', 'options': ['direct', 'recursive']},
+        'objective': {'type': 'STRING', 'options': ['cut', 'km1']},
+    },
+    constants={
+    'use_cyc': 1,
+    }
+
+)
+
+register_hyper_function(
+    name='cyc_kahypar-balanced',
+    ssa_func=kahypar_to_tree.trial_fn,
+    space={
+        'weight_edges': {'type': 'STRING', 'options': ['const', 'log']},
+        'cutoff': {'type': 'INT', 'min': 2, 'max': 4},
+        'imbalance': {'type': 'FLOAT', 'min': 0.001, 'max': 0.01},
+        'mode': {'type': 'STRING', 'options': ['direct', 'recursive']},
+        'objective': {'type': 'STRING', 'options': ['cut', 'km1']},
+    },
+    constants={
+        'random_strength': 0.0,
+        'imbalance_decay': 0.0,
+        'parts': 2,
+        'use_cyc': 1,
+    }
+)
+
+
+register_hyper_function(
+    name='cyc_kahypar-agglom',
+    ssa_func=kahypar_to_tree.trial_fn_agglom,
+    space={
+        'weight_edges': {'type': 'STRING', 'options': ['const', 'log']},
+        'imbalance': {'type': 'FLOAT', 'min': 0.001, 'max': 0.05},
+        'mode': {'type': 'STRING', 'options': ['direct', 'recursive']},
+        'objective': {'type': 'STRING', 'options': ['cut', 'km1']},
+        'groupsize': {'type': 'INT', 'min': 2, 'max': 10},
+        'compress': {'type': 'STRING', 'options': [0, 3, 10, 30, 100]}
+    },
+    constants={
+        'random_strength': 0.0,
+        'use_cyc': 1,
+    }
+)
+
+
+
+#cyc added
+
+register_hyper_function(
+    name='cyc2_kahypar',
+    ssa_func=kahypar_to_tree.trial_fn,
+    space={
+        'random_strength': {'type': 'FLOAT_EXP', 'min': 0.01, 'max': 10.},
+        'weight_edges': {'type': 'STRING', 'options': ['const', 'log']},
+        'cutoff': {'type': 'INT', 'min': 10, 'max': 40},
+        'imbalance': {'type': 'FLOAT', 'min': 0.01, 'max': 1.0},
+        'imbalance_decay': {'type': 'FLOAT', 'min': -5, 'max': 5},
+        'parts': {'type': 'INT', 'min': 2, 'max': 16},
+        'parts_decay': {'type': 'FLOAT', 'min': 0.0, 'max': 1.0},
+        'mode': {'type': 'STRING', 'options': ['direct', 'recursive']},
+        'objective': {'type': 'STRING', 'options': ['cut', 'km1']},
+    },
+    constants={
+    'use_cyc': 2,
+    }
+
+)
+
+register_hyper_function(
+    name='cyc2_kahypar-balanced',
+    ssa_func=kahypar_to_tree.trial_fn,
+    space={
+        'weight_edges': {'type': 'STRING', 'options': ['const', 'log']},
+        'cutoff': {'type': 'INT', 'min': 2, 'max': 4},
+        'imbalance': {'type': 'FLOAT', 'min': 0.001, 'max': 0.01},
+        'mode': {'type': 'STRING', 'options': ['direct', 'recursive']},
+        'objective': {'type': 'STRING', 'options': ['cut', 'km1']},
+    },
+    constants={
+        'random_strength': 0.0,
+        'imbalance_decay': 0.0,
+        'parts': 2,
+        'use_cyc': 2,
+    }
+)
+
+
+register_hyper_function(
+    name='cyc2_kahypar-agglom',
+    ssa_func=kahypar_to_tree.trial_fn_agglom,
+    space={
+        'weight_edges': {'type': 'STRING', 'options': ['const', 'log']},
+        'imbalance': {'type': 'FLOAT', 'min': 0.001, 'max': 0.05},
+        'mode': {'type': 'STRING', 'options': ['direct', 'recursive']},
+        'objective': {'type': 'STRING', 'options': ['cut', 'km1']},
+        'groupsize': {'type': 'INT', 'min': 2, 'max': 10},
+        'compress': {'type': 'STRING', 'options': [0, 3, 10, 30, 100]}
+    },
+    constants={
+        'random_strength': 0.0,
+        'use_cyc': 2,
     }
 )
