@@ -9,24 +9,18 @@ import collections
 from string import ascii_letters
 
 from opt_einsum.helpers import compute_size_by_dict, flop_count
-from opt_einsum.paths import get_path_fn, DynamicProgramming, linear_to_ssa
+from opt_einsum.paths import get_path_fn, DynamicProgramming
 from autoray import do
 
 from .utils import (
     MaxCounter,
     BitSet,
-    node_from_seq,
-    node_from_single,
-    node_supremum,
-    node_get_single_el,
-    is_valid_node,
     oset,
     groupby,
     interleave,
     unique,
     prod,
     dynary,
-
 )
 from .parallel import (
     parse_parallel_arg,
@@ -38,22 +32,36 @@ from .plot import (
     plot_tree_ring,
     plot_tree_tent,
     plot_tree_span,
-    plot_tree_rubberband,
     plot_contractions,
     plot_contractions_alt,
     plot_hypergraph,
 )
 
+
 # the default weighting for comparing flops vs mops
 try:
     from opt_einsum.paths import DEFAULT_COMBO_FACTOR
 except ImportError:
-    DEFAULT_COMBO_FACTOR = 64
+    DEFAULT_COMBO_FACTOR = 256
 
 try:
     from cotengra.cotengra import HyperGraph as HyperGraphRust
 except ImportError:
     HyperGraphRust = None
+
+
+def is_valid_node(node):
+    """Check ``node`` is of type frozenset[int].
+    """
+    try:
+        if not isinstance(node, frozenset):
+            return False
+        el = next(iter(node))
+        if not isinstance(el, int):
+            return False
+        return True
+    except TypeError:
+        return False
 
 
 def cached_node_property(name):
@@ -73,11 +81,15 @@ def cached_node_property(name):
     return wrapper
 
 
-def union_it(bs):
-    """Non-variadic version of various set type unions.
-    """
-    b0, *bs = bs
-    return b0.union(*bs)
+def to_ind_bitset(inds):
+    return BitSet(inds)
+
+
+def inds_union(terms):
+    t0, *ts = terms
+    return t0.bitset.fromint(
+        functools.reduce(operator.or_, (t.i for t in ts), t0.i)
+    )
 
 
 def get_with_default(k, obj, default):
@@ -119,12 +131,12 @@ class ContractionTree:
 
     Properties
     ----------
-    info : dict[node, dict]
+    info : dict[frozenset[int], dict]
         Information about the tree nodes. The key is the set of inputs (a
-        set of inputs indices) the node contains. Or in other words, the
+        frozenset of inputs indices) the node contains. Or in other words, the
         subgraph of the node. The value is a dictionary to cache information
         about effective 'leg' indices, size, flops of formation etc.
-    children : dict[node, tuple[node]
+    children : dict[frozenset[int], tuple[frozenset[int]]
         Mapping of each node to two children.
     """
 
@@ -140,7 +152,7 @@ class ContractionTree:
         self.size_dict = size_dict
         self.N = len(self.inputs)
 
-        self.bitset_edges = BitSet(size_dict.keys())
+        self.bitset_edges = to_ind_bitset(size_dict.keys())
         self.inputs_legs = list(map(self.bitset_edges, self.inputs))
         self.output_legs = self.bitset_edges(self.output)
 
@@ -152,7 +164,7 @@ class ContractionTree:
 
         # ... which we can fill in already for final / top node i.e.
         # the collection of all nodes
-        self.root = node_supremum(self.N)
+        self.root = frozenset(range(self.N))
         self.info[self.root] = {
             'legs': self.output_legs,
             'keep': self.output_legs,
@@ -258,7 +270,8 @@ class ContractionTree:
         """Generate the nodes representing leaves of the contraction tree, i.e.
         of size 1 each corresponding to a single input tensor.
         """
-        return map(node_from_single, range(self.N))
+        for i in range(self.N):
+            yield frozenset((i,))
 
     @classmethod
     def from_path(cls, inputs, output, size_dict, *,
@@ -316,7 +329,7 @@ class ContractionTree:
             # filter out the subgraph induced by edge `e` (generally a pair)
             new_terms, merge = [], []
             for node in nodes:
-                term = union_it(tree.node_to_terms(node))
+                term = inds_union(tree.node_to_terms(node))
                 if e in term:
                     merge.append(node)
                 else:
@@ -344,7 +357,8 @@ class ContractionTree:
             if len(self.children) > self.N - 1:
                 raise ValueError("There are too many branches already.")
             if not is_valid_node(node):
-                raise ValueError("{} is not a valid node.".format(node))
+                raise ValueError("{} is not a valid node - should be "
+                                 "frozenset[int].".format(node))
 
         self.info.setdefault(node, dict())
 
@@ -371,7 +385,7 @@ class ContractionTree:
         """
         nodes_above = self.root.difference(node)
         terms_above = self.node_to_terms(nodes_above)
-        return union_it((self.output_legs, *terms_above))
+        return inds_union((self.output_legs, *terms_above))
 
     @cached_node_property('legs')
     def get_legs(self, node):
@@ -379,11 +393,11 @@ class ContractionTree:
         in ``node``.
         """
         if len(node) == 1:
-            return self.inputs_legs[node_get_single_el(node)]
+            return self.inputs_legs[next(iter(node))]
         try:
             involved = self.get_involved(node)
         except KeyError:
-            involved = union_it(self.node_to_terms(node))
+            involved = inds_union(self.node_to_terms(node))
         keep = self.get_keep(node)
         return involved.intersection(keep)
 
@@ -394,7 +408,7 @@ class ContractionTree:
         if len(node) == 1:
             return self.bitset_edges.infimum
         sub_legs = map(self.get_legs, self.children[node])
-        return union_it(sub_legs)
+        return inds_union(sub_legs)
 
     @cached_node_property('removed')
     def get_removed(self, node):
@@ -440,7 +454,7 @@ class ContractionTree:
 
         if len(node) == 1:
             # leaf indices are fixed
-            i = node_get_single_el(node)
+            i, = node
             if not self.sliced_inds:
                 return "".join(self.inputs[i])
             legs = self.get_legs(node)
@@ -586,16 +600,6 @@ class ContractionTree:
             peak = max(peak, tot_size)
         return peak
 
-    def total_size(self):
-        """Get the total sum of all intermediate tensor sizes, this is relevant
-        when, for example, using autodiff on a contraction without
-        checkpointing.
-        """
-        tot_size = sum(self.get_size(node) for node in self.gen_leaves())
-        for node, _, _ in self.traverse():
-            tot_size += self.get_size(node)
-        return tot_size
-
     def arithmetic_intensity(self):
         """The ratio of total flops to total write - the higher the better for
         extracting good computational performance.
@@ -612,30 +616,25 @@ class ContractionTree:
         """
         return math.log2(self.max_size())
 
-    def compressed_contract_stats(
-        self,
-        chi,
-        order='surface_order',
-        compress_late=True,
-    ):
+    def max_size_compressed(self, chi, order='surface_order',
+                            compress_late=True):
+        """Compute the maximum sized tensor produced when a compressed
+        contraction is performed with maximum bond size ``chi``, ordered by
+        ``order``.
+        """
+        if order == 'surface_order':
+            order = self.surface_order
+
         hg = self.get_hypergraph(accel='auto')
 
         # conversion between tree nodes <-> hypergraph nodes during contraction
         tree_map = dict(zip(self.gen_leaves(), range(hg.get_num_nodes())))
 
-        max_size = 0
-        current_size = 0
-        for i in range(hg.get_num_nodes()):
-            s = hg.node_size(i)
-            max_size = max(max_size, s)
-            current_size += s
-        total_size = peak_size = current_size
+        size_max = max(map(hg.node_size, range(hg.get_num_nodes())))
 
         for p, l, r in self.traverse(order):
             li = tree_map[l]
             ri = tree_map[r]
-
-            current_size -= hg.neighborhood_size((li, ri))
 
             if compress_late:
                 # compress just before we contract tensors
@@ -643,61 +642,49 @@ class ContractionTree:
                 hg.compress(chi=chi, edges=hg.get_node(ri))
 
             pi = tree_map[p] = hg.contract(li, ri)
-
-            pi_size = hg.node_size(pi)
-            max_size = max(max_size, pi_size)
-            current_size += hg.neighborhood_size((pi,))
-            peak_size = max(peak_size, current_size)
-            total_size += pi_size
+            size_max = max(size_max, hg.node_size(pi))
 
             if not compress_late:
                 # compress as soon as we can after contracting tensors
                 hg.compress(chi=chi, edges=hg.get_node(pi))
 
-        return {
-            'max_size': max_size,
-            'total_size': total_size,
-            'peak_size': peak_size,
-        }
-
-    def max_size_compressed(self, chi, order='surface_order',
-                            compress_late=True):
-        """Compute the maximum sized tensor produced when a compressed
-        contraction is performed with maximum bond size ``chi``, ordered by
-        ``order``. This is close to the ideal space complexity if only
-        tensors that are being directly operated on are kept in memory.
-        """
-        return self.compressed_contract_stats(
-            chi=chi,
-            order=order,
-            compress_late=compress_late,
-        )['max_size']
+        return size_max
 
     def peak_size_compressed(self, chi, order='surface_order',
                              compress_late=True, accel='auto'):
         """Compute the peak size of combined intermediate tensors when a
         compressed contraction is performed with maximum bond size ``chi``,
-        ordered by ``order``. This is the practical space complexity if one is
-        not swapping intermediates in and out of memory.
+        ordered by ``order``.
         """
-        return self.compressed_contract_stats(
-            chi=chi,
-            order=order,
-            compress_late=compress_late,
-        )['peak_size']
+        if order == 'surface_order':
+            order = self.surface_order
 
-    def total_size_compressed(self, chi, order='surface_order',
-                              compress_late=True, accel='auto'):
-        """Compute the total size of all intermediate tensors when a
-        compressed contraction is performed with maximum bond size ``chi``,
-        ordered by ``order``. This is relevant maybe for time complexity and
-        e.g. autodiff space complexity (since every intermediate is kept).
-        """
-        return self.compressed_contract_stats(
-            chi=chi,
-            order=order,
-            compress_late=compress_late,
-        )['total_size']
+        hg = self.get_hypergraph(accel=accel)
+
+        # conversion between tree nodes <-> hypergraph nodes during contraction
+        tree_map = {leaf: i for i, leaf in enumerate(self.gen_leaves())}
+
+        size = hg.total_node_size()
+        size_peak = size
+
+        for p, l, r in self.traverse(order):
+            li = tree_map[l]
+            ri = tree_map[r]
+
+            size -= hg.neighborhood_size((li, ri))
+
+            if compress_late:
+                hg.compress(chi=chi, edges=hg.get_node(li) + hg.get_node(ri))
+
+            pi = tree_map[p] = hg.contract(li, ri)
+
+            size += hg.neighborhood_size((pi,))
+            size_peak = max(size_peak, size)
+
+            if not compress_late:
+                hg.compress(chi=chi, edges=hg.get_node(pi))
+
+        return size_peak
 
     def contract_nodes_pair(self, x, y, check=False):
         """Contract node ``x`` with node ``y`` in the tree to create a new
@@ -711,14 +698,13 @@ class ContractionTree:
 
         # enforce left ordering of 'heaviest' subtrees
         nx, ny = len(x), len(y)
+        # deterministically break ties
         hx, hy = hash(x), hash(y)
 
-        # deterministically break ties
         if (nx, hx) > (ny, hy):
             lr = (x, y)
         else:
             lr = (y, x)
-
         self.children[parent] = lr
 
         if self.track_childless:
@@ -748,7 +734,7 @@ class ContractionTree:
             return self.contract_nodes_pair(*nodes, check=check)
 
         # create the bottom and top nodes
-        grandparent = union_it(nodes)
+        grandparent = frozenset.union(*nodes)
         self._add_node(grandparent, check=check)
         for node in nodes:
             self._add_node(node, check=check)
@@ -776,7 +762,7 @@ class ContractionTree:
         temp_nodes = list(nodes)
         for p in path:
             to_contract = [
-                temp_nodes.pop(i) for i in sorted(p, reverse=True)
+                frozenset(temp_nodes.pop(i)) for i in sorted(p, reverse=True)
             ]
             temp_nodes.append(
                 self.contract_nodes(
@@ -813,17 +799,11 @@ class ContractionTree:
 
         return True
 
-    def get_default_order(self):
-        return "dfs"
-
     def _traverse_ordered(self, order):
         """Traverse the tree in the order that minimizes ``order(node)``, but
         still contrained to produce children before parents.
         """
         from bisect import bisect
-
-        if order == 'surface_order':
-            order = self.surface_order
 
         seen = set()
         queue = [self.root]
@@ -862,7 +842,7 @@ class ContractionTree:
 
         Returns
         -------
-        generator[tuple[node]]
+        generator[tuple[frozenset[frozenset[str]]]]
             The bottom up ordered sequence of tree merges, each a
             tuple of ``(parent, left_child, right_child)``.
 
@@ -870,10 +850,7 @@ class ContractionTree:
         --------
         descend
         """
-        if order is None:
-            order = self.get_default_order()
-
-        if order != "dfs":
+        if order is not None:
             yield from self._traverse_ordered(order=order)
             return
 
@@ -906,7 +883,7 @@ class ContractionTree:
 
         Returns
         -------
-        generator[tuple[node]
+        generator[tuple[frozenset[frozenset[str]]]]
             The top down ordered sequence of tree merges, each a
             tuple of ``(parent, left_child, right_child)``.
 
@@ -933,7 +910,7 @@ class ContractionTree:
 
         Parameters
         ----------
-        node : node
+        node : frozenset[int]
             The node of the tree to start with.
         size : int
             How many subtree leaves to aim for.
@@ -946,9 +923,9 @@ class ContractionTree:
 
         Returns
         -------
-        sub_leaves : tuple[node]
+        sub_leaves : tuple[frozenset[int]]
             Nodes which are subtree leaves.
-        branches : tuple[node]
+        branches : tuple[frozenset[int]]
             Nodes which are between the subtree leaves and root.
         """
         # nodes which are subtree leaves
@@ -977,7 +954,6 @@ class ContractionTree:
             #     if we append it last then ``.pop(-1)`` above perform the
             #     depth first search sorting by node subgraph size
             l, r = self.children[p]
-
             queue.append(r)
             queue.append(l)
             branches.append(p)
@@ -1046,8 +1022,8 @@ class ContractionTree:
 
             if len(node) == 1:
                 # its a leaf - corresponding input will be sliced
-                i = node_get_single_el(node)
-                tree.sliced_inputs = tree.sliced_inputs | frozenset([i])
+                tree.sliced_inputs = tree.sliced_inputs | node
+                i = next(iter(node))
                 tree.inputs_legs[i] = tree.inputs_legs[i] - s_ind
             elif len(node) == tree.N:
                 # root node
@@ -1712,91 +1688,6 @@ class ContractionTree:
     slice_and_reconfigure_forest_ = functools.partialmethod(
         slice_and_reconfigure_forest, inplace=True)
 
-    def compressed_reconfigure(
-        self,
-        chi,
-        order_only=False,
-        max_nodes='auto',
-        max_time=None,
-        local_score=None,
-        exploration_power=0,
-        best_score=None,
-        progbar=False,
-        inplace=False,
-    ):
-        """Reconfigure this tree according to ``peak_size_compressed``.
-
-        Parameters
-        ----------
-        chi : int
-            The maximum bond dimension to consider.
-        order_only : bool, optional
-            Whether to only consider the ordering of the current tree
-            contractions, or all possible contractions, starting with the
-            current.
-        max_nodes : int, optional
-            Set the maximum number of contraction steps to consider.
-        max_time : float, optional
-            Set the maximum time to spend on the search.
-        local_score : callable, optional
-            A function that assigns a score to a potential contraction, with a
-            lower score giving more priority to explore that contraction
-            earlier. It should have signature::
-
-                local_score(step, new_score, dsize, new_size)
-
-            where ``step`` is the number of steps so far, ``new_score`` is the
-            score of the contraction so far, ``dsize`` is the change in memory
-            by the current step, and ``new_size`` is the new memory size after
-            contraction.
-        exploration_power : float, optional
-            If not ``0.0``, the inverse power to which the step is raised in
-            the default local score function. Higher values favor exploring
-            more promising branches early on - at the cost of increased memory.
-            Ignored if ``local_score`` is supplied.
-        best_score : float, optional
-            Manually specify an upper bound for best score found so far.
-        progbar : bool, optional
-            If ``True``, display a progress bar.
-        inplace : bool, optional
-            Whether to perform the reconfiguration inplace on this tree.
-
-        Returns
-        -------
-        ContractionTree
-        """
-        from .path_compressed import CompressedExhaustive
-
-        if max_nodes == 'auto':
-            if max_time is None:
-                max_nodes = max(10_000, self.N**2)
-            else:
-                max_nodes = float('inf')
-
-        opt = CompressedExhaustive(
-            chi=chi,
-            local_score=local_score,
-            max_nodes=max_nodes,
-            max_time=max_time,
-            exploration_power=exploration_power,
-            best_score=best_score,
-            progbar=progbar,
-        )
-        opt.setup(self.inputs, self.output, self.size_dict)
-        opt.explore_path(self.path_surface(), restrict=order_only)
-        ssa_path = opt(self.inputs, self.output, self.size_dict)
-        rtree = ContractionTree.from_path(
-            self.inputs, self.output, self.size_dict, ssa_path=ssa_path,
-        )
-        if inplace:
-            self.set_state_from(rtree)
-            rtree = self
-        rtree.set_surface_order_from_path(ssa_path)
-        return rtree
-
-    compressed_reconfigure_ = functools.partialmethod(
-        compressed_reconfigure, inplace=True)
-
     def flat_tree(self, order=None):
         """Create a nested tuple representation of the contraction tree like::
 
@@ -1811,9 +1702,9 @@ class ContractionTree:
             (012, 3456789)
             0123456789
 
-        Where each integer represents a leaf (i.e. single element node).
+        Where each integer represents a leaf (i.e. frozenset[str]).
         """
-        tups = dict(zip(self.gen_leaves(), range(self.N)))
+        tups = {frozenset([i]): i for i in range(self.N)}
 
         for parent, l, r in self.traverse(order=order):
             tups[parent] = tups[l], tups[r]
@@ -1854,7 +1745,7 @@ class ContractionTree:
         """Generate a ssa path from the contraction tree.
         """
         ssa_path = []
-        pos = dict(zip(self.gen_leaves(), range(self.N)))
+        pos = {frozenset([i]): i for i in range(self.N)}
 
         for parent, l, r in self.traverse(order=order):
             i, j = sorted((pos[l], pos[r]))
@@ -1916,7 +1807,7 @@ class ContractionTree:
         candidates = [
             {
                 # which intermedate nodes map to which leaf nodes
-                'map': {self.root: node_from_single(l2)},
+                'map': {self.root: frozenset([l2])},
                 # the leaf nodes in the spanning tree
                 'spine': {l1, l2},
             }
@@ -1944,8 +1835,7 @@ class ContractionTree:
 
                         # valid extension of spanning tree
                         candidates.append({
-                            'map': {child: node_from_single(l2),
-                                    **cand['map']},
+                            'map': {child: frozenset([l2]), **cand['map']},
                             'spine': cand['spine'] | {l1, l2},
                         })
 
@@ -1967,7 +1857,7 @@ class ContractionTree:
             'min': min,
         }.get(combine, combine)
 
-        for p, l, r in self.traverse('dfs'):
+        for p, l, r in self.traverse():
             self.info[p]['centrality'] = combine(
                 self.info[l]['centrality'],
                 self.info[r]['centrality'])
@@ -2461,7 +2351,6 @@ class ContractionTree:
     plot_ring = plot_tree_ring
     plot_tent = plot_tree_tent
     plot_span = plot_tree_span
-    plot_rubberband = plot_tree_rubberband
     plot_contractions = plot_contractions
     plot_contractions_alt = plot_contractions_alt
 
@@ -2471,11 +2360,8 @@ class ContractionTree:
         hg.plot(**kwargs)
 
     def __repr__(self):
-        s = "<{}(N={}, branches={}, complete={})>"
-        return s.format(
-            self.__class__.__name__,
-            self.N, len(self.children), self.is_complete()
-        )
+        s = "<ContractionTree(N={}, branches={}, complete={})>"
+        return s.format(self.N, len(self.children), self.is_complete())
 
 
 def _reconfigure_tree(tree, *args, **kwargs):
@@ -2535,7 +2421,10 @@ def score_size_compressed(trial, chi='auto'):
     if chi == 'auto':
         chi = max(tree.size_dict.values())**2
     size = tree.max_size_compressed(chi)
-    cr = (math.log2(size) + math.log2(tree.max_size())**0.5 / 1000)
+    cr = (
+        math.log2(size) +
+        math.log2(tree.max_size())**0.5 / 1000
+    )
     # overwrite the effective max size
     trial['size'] = size
     return cr
@@ -2552,21 +2441,8 @@ def score_peak_size_compressed(trial, chi='auto'):
     return cr
 
 
-def score_total_size_compressed(trial, chi='auto'):
-    tree = trial['tree']
-    if chi == 'auto':
-        chi = max(tree.size_dict.values())**2
-    size = tree.total_size_compressed(chi)
-    cr = (math.log2(size) + math.log2(tree.max_size())**0.5 / 1000)
-    # overwrite the effective max size
-    trial['size'] = size
-    return cr
-
-
 score_matcher = re.compile(
-    r"(flops|size|write|combo|limit|max-compressed|"
-    r"peak-compressed|total-compressed)-*(\d*)"
-)
+    r"(flops|size|write|combo|limit|max-compressed|peak-compressed)-*(\d*)")
 
 
 def get_score_fn(minimize):
@@ -2601,51 +2477,12 @@ def get_score_fn(minimize):
         chi = int(param) if param else 'auto'
         return functools.partial(score_peak_size_compressed, chi=chi)
 
-    if which == 'total-compressed':
-        chi = int(param) if param else 'auto'
-        return functools.partial(score_total_size_compressed, chi=chi)
-
 
 def _describe_tree(tree):
     return (
         f"log2[SIZE]: {math.log2(tree.max_size()):.2f} "
         f"log10[FLOPs]: {math.log10(tree.total_flops()):.2f}"
     )
-
-
-class ContractionTreeCompressed(ContractionTree):
-    """A contraction tree for compressed contractions. Currently the only
-    difference is that this defaults to the 'surface' traversal ordering.
-    """
-
-    @classmethod
-    def from_path(cls, inputs, output, size_dict, *,
-                  path=None, ssa_path=None, check=False, **kwargs):
-        """Create a (completed) ``ContractionTreeCompressed`` from the usual
-        inputs plus a standard contraction path or 'ssa_path' - you need to
-        supply one. This also set the default 'surface' traversal ordering to
-        be the initial path.
-        """
-        if int(path is None) + int(ssa_path is None) != 1:
-            raise ValueError("Exactly one of ``path`` or ``ssa_path`` must be "
-                             "supplied.")
-
-        if path is not None:
-            ssa_path = linear_to_ssa(path)
-
-        tree = cls(inputs, output, size_dict, **kwargs)
-        terms = list(tree.gen_leaves())
-
-        for p in ssa_path:
-            merge = [terms[i] for i in p]
-            terms.append(tree.contract_nodes(merge, check=check))
-
-        tree.set_surface_order_from_path(ssa_path)
-
-        return tree
-
-    def get_default_order(self):
-        return "surface_order"
 
 
 class PartitionTreeBuilder:
@@ -2700,10 +2537,8 @@ class PartitionTreeBuilder:
 
             # skip straight to better method
             if subsize <= cutoff:
-                tree.contract_nodes(
-                    [node_from_single(x) for x in subgraph],
-                    optimize=sub_optimize, check=check
-                )
+                tree.contract_nodes([frozenset([x]) for x in subgraph],
+                                    optimize=sub_optimize, check=check)
                 continue
 
             # relative subgraph size
@@ -2736,16 +2571,12 @@ class PartitionTreeBuilder:
             # divide subgraph up e.g. if we enumerate the subgraph index sets
             # (0, 1, 2, 3, 4, 5, 6, 7, 8, ...) ->
             # ({0, 1, 3, 5, 6}, {2, 4}, {7, 8})
-            new_subgs = tuple(map(
-                node_from_seq, separate(subgraph, membership)
-            ))
+            new_subgs = tuple(map(frozenset, separate(subgraph, membership)))
 
             if len(new_subgs) == 1:
                 # no communities found - contract all remaining
-                tree.contract_nodes(
-                    tuple(map(node_from_single, subgraph)),
-                    optimize=sub_optimize, check=check
-                )
+                tree.contract_nodes([frozenset([x]) for x in subgraph],
+                                    optimize=sub_optimize, check=check)
                 continue
 
             tree.contract_nodes(
@@ -2975,10 +2806,12 @@ class HyperGraph:
         The number of hyper-edges.
     """
 
-    __slots__ = ('inputs', 'output', 'size_dict',
-                 'nodes', 'edges', 'compressed', 'node_counter')
 
-    def __init__(self, inputs, output=None, size_dict=None):
+    __slots__ = ('inputs', 'output', 'size_dict',
+                     'nodes', 'edges', 'compressed', 'node_counter', 'original_num_nodes', 'use_cyc')# cyc added original_num_nodes, use_cyc
+
+    #cyc added use_cyc
+    def __init__(self, inputs, output=None, size_dict=None, use_cyc=None):
         self.inputs = inputs
         self.output = [] if output is None else list(output)
         self.size_dict = {} if size_dict is None else dict(size_dict)
@@ -2993,8 +2826,21 @@ class HyperGraph:
             for e in term:
                 self.edges[e] += (i,)
 
+        # cyc added
+        #print("here ", use_cyc)
+        self.use_cyc = use_cyc
+        if self.use_cyc == 1:
+            self.original_num_nodes = len(self.nodes)
+            for i, o_index in enumerate(self.output):
+                self.nodes[i+self.original_num_nodes] = o_index
+
         self.compressed = set()
         self.node_counter = self.num_nodes - 1
+
+    #cyc added
+    @property
+    def origin_num_nodes(self):
+        return self.original_num_nodes# cyc added
 
     def copy(self):
         """Copy this ``HyperGraph``.
@@ -3445,25 +3291,13 @@ class HyperGraph:
             cents = dict_affine_renorm(cents)
         return cents
 
-    def to_networkx(H, as_tree_leaves=False):
+    def to_networkx(H):
         """Convert to a networkx Graph, with hyperedges represented as nodes.
-
-        Parameters
-        ----------
-        as_tree_leaves : bool, optional
-            If true, then the nodes are converted to 'tree leaf' form, i.e.
-            map node ``i`` to ``frozenset([i])``, to match the nodes in a
-            ``ContractionTree``.
         """
         import networkx as nx
 
-        # any_hyper is just a custom attribute
         G = nx.Graph(any_hyper=False)
         for ix, nodes in H.edges.items():
-
-            if as_tree_leaves:
-                nodes = [frozenset([node]) for node in nodes]
-
             if len(nodes) == 2:
                 # regular edge
                 G.add_edge(*nodes, ind=ix, hyperedge=False)
@@ -3487,21 +3321,55 @@ class HyperGraph:
         winfo = {}
 
         winfo['node_weights'] = tuple(
-            calc_node_weight(term, self.size_dict, weight_nodes)
-            for term in self.nodes.values()
-        )
+                calc_node_weight(term, self.size_dict, weight_nodes)
+                for term in self.nodes.values()
+            ) 
+
+        if self.use_cyc == 2:
+            #cyc change tuple to list
+            winfo['node_weights'] = list(
+                calc_node_weight(term, self.size_dict, weight_nodes)
+                for term in self.nodes.values()
+            )   
+
+            # cyc added
+            for onode in tuple(self.output_nodes()):
+                winfo['node_weights'][onode] = 1000000
+                #print('cyc')
+            winfo['node_weights'] = tuple(winfo['node_weights'])
+
+
+        if self.use_cyc == 1:
+            
+            sum_node_weights = 0
+            for weight in winfo['node_weights'][:self.origin_num_nodes]:
+                sum_node_weights = sum_node_weights + weight
+            winfo['node_weights'] = winfo['node_weights'][:self.origin_num_nodes] + tuple(1000000 for _ in range((self.num_nodes - self.origin_num_nodes)//2*2))# cyc added self.origin_num_nodes//20
+
 
         winfo['edge_list'] = tuple(self.edges)
         winfo['edge_weight_map'] = {
             e: calc_edge_weight(e, self.size_dict, weight_edges)
             for e in winfo['edge_list']
         }
+
+        if self.use_cyc == 1:
+            # cyc added
+            for e in self.output:
+                winfo['edge_weight_map'][e] = 1000000# * winfo['edge_weight_map'][e]
+
         winfo['edge_weights'] = tuple(
             winfo['edge_weight_map'][e] for e in winfo['edge_list']
         )
 
-        winfo['has_edge_weights'] = weight_edges in ('log', 'linear')
-        winfo['has_node_weights'] = weight_nodes in ('log', 'linear')
+        winfo['has_edge_weights'] =  weight_edges in ('log', 'linear')
+        winfo['has_node_weights'] =  weight_nodes in ('log', 'linear')
+
+        # cyc added
+        if self.use_cyc:
+            winfo['has_edge_weights'] = True
+            winfo['has_node_weights'] = True
+
         winfo['fmt'] = {
             (False, False): "",
             (False, True): "10",
@@ -3517,7 +3385,8 @@ class HyperGraph:
         return f"<HyperGraph(|V|={self.num_nodes}, |E|={self.num_edges})>"
 
 
-def get_hypergraph(inputs, output=None, size_dict=None, accel=False):
+#cyc added use_cyc
+def get_hypergraph(inputs, output=None, size_dict=None, accel=False, use_cyc=None):
     """Single entry-point for creating a, possibly accelerated, HyperGraph.
     """
     if accel == 'auto':
@@ -3530,6 +3399,6 @@ def get_hypergraph(inputs, output=None, size_dict=None, accel=False):
             output = [] if output is None else list(output)
         if not isinstance(size_dict, dict):
             size_dict = {} if size_dict is None else dict(size_dict)
-        return HyperGraphRust(inputs, output, size_dict)
+        return HyperGraphRust(inputs, output, size_dict, use_cyc=use_cyc)
 
-    return HyperGraph(inputs, output, size_dict)
+    return HyperGraph(inputs, output, size_dict, use_cyc=use_cyc)
